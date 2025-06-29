@@ -1,0 +1,75 @@
+{
+  "hardware_constraints": {
+    "max_memory_gb": 2,
+    "max_cpu_cores": 1,
+    "enable_gpu": true,
+    "memory_efficiency": "high"
+  },
+  "data_processing": {
+    "chunk_size": 500,
+    "max_text_length": 512,
+    "filter_short_texts": true,
+    "streaming_enabled": true,
+    "compression_enabled": true
+  },
+  "training": {
+    "checkpoint_frequency": 250,
+    "eval_frequency": 500,
+    "early_stopping_patience": 3,
+    "gradient_accumulation_steps": 8,
+    "mixed_precision": true
+  },
+  "model": {
+    "model_name": "gpt2",
+    "base_model": "gpt2",
+    "max_length": 512,
+    "batch_size": 8,
+    "learning_rate_pretraining": 3e-5,
+    "learning_rate_finetuning": 5e-6,
+    "lora_enabled": true,
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.1
+  },
+  "datasets": {
+    "pretraining": {
+      "redpajama": {
+        "enabled": true,
+        "max_samples": 20000,
+        "filter_language": "en"
+      },
+      "c4": {
+        "enabled": true,
+        "max_samples": 5000,
+        "filter_language": "en"
+      }
+    },
+    "finetuning": {
+      "sharegpt52k": {
+        "enabled": true,
+        "max_samples": 2000,
+        "conversation_format": "chat"
+      },
+      "dialogstudio": {
+        "enabled": true,
+        "max_samples": 1000,
+        "conversation_format": "dialogue"
+      }
+    }
+  },
+  "monitoring": {
+    "enable_wandb": false,
+    "log_metrics": true,
+    "save_conversations": true,
+    "progress_bar": true,
+    "memory_monitoring": true
+  },
+  "output": {
+    "base_dir": "models/JARVIS",
+    "checkpoint_dir": "data/checkpoints",
+    "logs_dir": "logs",
+    "save_final_model": true,
+    "export_formats": ["pytorch", "onnx"],
+    "output_dir": "models/JARVIS/pretrained"
+  }
+} 
