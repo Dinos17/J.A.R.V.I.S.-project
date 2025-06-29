@@ -36,7 +36,6 @@ class StreamingDataProcessor:
     def download_and_process_redpajama(self, max_samples: int = 1000000) -> Iterator[Dict]:
         """Download and process RedPajama-Data-1T dataset from Hugging Face."""
         logger.info("Downloading RedPajama-Data-1T dataset...")
-        # Focus on subsets that work well, skip problematic ones
         subsets_to_try = ['common_crawl']  # Only use common_crawl as it works reliably
         total = 0
         
@@ -76,7 +75,13 @@ class StreamingDataProcessor:
                     
             except Exception as e:
                 logger.warning(f"❌ Failed to process RedPajama subset {subset}: {e}")
-                continue
+                # Fallback to local processing if file exists
+                local_path = f"data/pretraining/redpajama/{subset}.jsonl.gz"
+                if os.path.exists(local_path):
+                    logger.info(f"Falling back to local RedPajama processing for {subset}...")
+                    yield from self.process_redpajama_stream(local_path)
+                else:
+                    logger.error(f"Local RedPajama file not found: {local_path}. Skipping RedPajama subset {subset}.")
         
         if total == 0:
             logger.error("No usable RedPajama samples found. Skipping RedPajama dataset.")
@@ -180,17 +185,15 @@ class StreamingDataProcessor:
     def download_and_process_c4(self, max_samples: int = 500000) -> Iterator[Dict]:
         """Download and process C4 dataset from Hugging Face."""
         logger.info("Downloading C4 dataset...")
-        
+        import os
         try:
             # Load dataset from Hugging Face (English subset)
             dataset = load_dataset("allenai/c4", "en", split="train", streaming=True)
-            
             count = 0
             # Process samples
             for i, sample in enumerate(tqdm(dataset, desc="Processing C4", total=max_samples)):
                 if i >= max_samples:
                     break
-                
                 text = self._extract_text_from_sample(sample)
                 if text and len(text) > 50:
                     yield {
@@ -199,14 +202,16 @@ class StreamingDataProcessor:
                         'length': len(text)
                     }
                     count += 1
-            
             logger.info(f"✅ Processed {count} samples from C4 dataset.")
-                    
         except Exception as e:
             logger.error(f"Error downloading C4: {e}")
-            # Fallback to local processing if download fails
-            logger.info("Falling back to local C4 processing...")
-            yield from self.process_c4_stream("data/pretraining/c4/c4.jsonl")
+            # Fallback to local processing if download fails and file exists
+            local_path = "data/pretraining/c4/c4.jsonl"
+            if os.path.exists(local_path):
+                logger.info("Falling back to local C4 processing...")
+                yield from self.process_c4_stream(local_path)
+            else:
+                logger.error(f"Local C4 file not found: {local_path}. Skipping C4 dataset.")
     
     def download_and_process_sharegpt52k(self, max_samples: int = 52000) -> Iterator[Dict]:
         """Download and process ShareGPT52K dataset from Hugging Face."""
