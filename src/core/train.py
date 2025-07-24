@@ -20,6 +20,7 @@ from typing import List, Dict, Optional, Any, Iterator, Union
 from dataclasses import dataclass
 import warnings
 from datetime import datetime
+import time
 
 import torch
 import torch.nn as nn
@@ -247,29 +248,41 @@ class ConversationFormatter:
         return text
 
 class ProgressBarCallback(TrainerCallback):
-    """Custom progress bar callback with detailed metrics."""
-    
-    def __init__(self, total_steps: Optional[int] = None):
+    """Custom progress bar callback with detailed metrics and highly accurate ETA."""
+    def __init__(self, total_steps: Optional[int] = None, rolling_window: int = 100, log_every_n_steps: int = 20):
         super().__init__()
         self.pbar = tqdm(total=total_steps, desc="Training Progress", position=0, leave=True, dynamic_ncols=True)
         self.last_step = 0
-    
+        self.last_time = time.time()
+        self.step_times = []
+        self.rolling_window = rolling_window
+        self.log_every_n_steps = log_every_n_steps
+
     def on_step_end(self, args, state, control, **kwargs):
         steps = state.global_step - self.last_step
+        now = time.time()
         if steps > 0:
+            step_time = (now - self.last_time) / steps
+            self.step_times.append(step_time)
+            if len(self.step_times) > self.rolling_window:
+                self.step_times.pop(0)
+            avg_step_time = sum(self.step_times) / len(self.step_times)
+            steps_remaining = state.max_steps - state.global_step if state.max_steps else 0
+            eta_seconds = int(avg_step_time * steps_remaining)
+            eta_str = time.strftime('%H:%M:%S', time.gmtime(eta_seconds)) if eta_seconds > 0 else '00:00:00'
             self.pbar.update(steps)
             self.last_step = state.global_step
-            
+            self.last_time = now
             # Get latest loss
             loss = state.log_history[-1]['loss'] if state.log_history and 'loss' in state.log_history[-1] else 'N/A'
-            eta = self.pbar.format_dict.get('remaining', 'N/A')
-            
             self.pbar.set_postfix({
                 "Step": state.global_step,
                 "Loss": f"{loss:.4f}" if isinstance(loss, float) else loss,
-                "ETA": eta
+                "ETA": eta_str
             })
-    
+            if state.global_step % self.log_every_n_steps == 0 or state.global_step == state.max_steps:
+                logger.info(f"[ETA] Step {state.global_step}/{state.max_steps} | ETA: {eta_str} | Loss: {loss}")
+
     def on_train_end(self, args, state, control, **kwargs):
         self.pbar.close()
 
@@ -301,10 +314,10 @@ class AdvancedJARVISTrainer:
         self._setup_logging()
     
     def _setup_directories(self):
-        """Create necessary directories, skipping logs_dir to avoid log file creation."""
+        """Create necessary directories, skipping logs_dir and data/checkpoints to avoid unwanted folder creation."""
         directories = [
-            self.config.output_dir,
-            self.config.checkpoint_dir
+            self.config.output_dir
+            # self.config.checkpoint_dir  # Do not create data/checkpoints
             # self.config.logs_dir  # Do not create logs_dir
         ]
         for directory in directories:
@@ -483,74 +496,130 @@ class AdvancedJARVISTrainer:
         except Exception as e:
             logger.error(f"Error loading dataset {dataset_config['name']}: {e}")
     
+    def _get_completed_datasets_from_checkpoints(self):
+        """Detect completed datasets by scanning for checkpoint directories."""
+        completed = set()
+        output_dir = Path(self.config.output_dir)
+        for item in output_dir.iterdir():
+            if item.is_dir() and item.name.startswith("temp_training_"):
+                dataset_name = item.name.replace("temp_training_", "")
+                # Check for at least one checkpoint inside
+                if any((item / d).is_dir() and d.startswith("checkpoint-") for d in os.listdir(item)):
+                    completed.add(dataset_name)
+        return completed
+
     def download_train_save_delete(self, dataset_configs: List[Dict]):
-        """Download → Train → Save → Delete pipeline for each dataset."""
+        """Download → Train → Save → Delete pipeline for each dataset, with global checkpointing and emergency checkpoint on interrupt."""
         logger.info("Starting FAST Download → Train → Save → Delete pipeline...")
-        
-        # Load model and tokenizer once
-        self.load_model_and_tokenizer()
-        
-        for i, config in enumerate(dataset_configs):
-            if not config.get('enabled', True):
-                continue
 
-            dataset_name = config['name']
-            max_samples = config.get('max_samples')
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Processing dataset {i+1}/{len(dataset_configs)}: {dataset_name}")
-            logger.info(f"{'='*60}")
+        global_ckpt_dir = Path(f"{self.config.output_dir}/global_checkpoint")
+        progress_file = global_ckpt_dir / "progress.json"
+        completed_datasets = set()
+        resume_model_path = None
 
-            # Improved log message for sample limit
-            if max_samples:
-                logger.info(f"Step 1: Downloading {dataset_name} (up to {max_samples} samples)...")
-            else:
-                logger.info(f"Step 1: Downloading {dataset_name} (ENTIRE DATASET)...")
+        # Check for global checkpoint progress
+        if progress_file.exists():
+            logger.info(f"Resuming from global checkpoint: {progress_file}")
+            with open(progress_file, 'r') as pf:
+                progress_data = json.load(pf)
+                completed_datasets.update(progress_data.get("completed_datasets", []))
+            resume_model_path = str(global_ckpt_dir)
+            # Load model/tokenizer from global checkpoint
+            self.load_model_and_tokenizer_from_path(resume_model_path)
+        else:
+            # Load model and tokenizer from scratch
+            self.load_model_and_tokenizer()
 
-            try:
-                tokenized_data = []
-                
-                for sample in self.load_dataset_streaming(config):
-                    tokenized_data.append(sample)
-                    
-                    if len(tokenized_data) % 2000 == 0:  # Less frequent logging for speed
-                        logger.info(f"Collected {len(tokenized_data)} samples from {dataset_name}")
-                
-                if not tokenized_data:
-                    logger.warning(f"No valid data collected from {dataset_name}, skipping...")
+        # Add datasets detected from checkpoint directories
+        completed_datasets.update(self._get_completed_datasets_from_checkpoints())
+
+        try:
+            for i, config in enumerate(dataset_configs):
+                dataset_name = config['name']
+                if not config.get('enabled', True):
                     continue
-                
-                logger.info(f"Downloaded {len(tokenized_data)} samples from {dataset_name} (ENTIRE DATASET)")
-                
-                # Step 2: Train on the data
-                logger.info(f"Step 2: Training on {dataset_name}...")
-                self._train_on_dataset(tokenized_data, dataset_name, i)
-                
-                # Step 3: Save model checkpoint
-                logger.info(f"Step 3: Saving checkpoint for {dataset_name}...")
-                checkpoint_path = f"{self.config.output_dir}/checkpoint_{dataset_name}"
-                if self.model is not None:
-                    self.model.save_pretrained(checkpoint_path)
-                if self.tokenizer is not None:
-                    self.tokenizer.save_pretrained(checkpoint_path)
-                
-                # Step 4: Clear data from memory (delete)
-                logger.info(f"Step 4: Clearing {dataset_name} data from memory...")
-                del tokenized_data
-                gc.collect()
-                
-                logger.info(f"Completed processing {dataset_name}")
-                
-            except Exception as e:
-                logger.error(f"Error processing {dataset_name}: {e}")
-                continue
-        
+                if dataset_name in completed_datasets:
+                    logger.info(f"Skipping {dataset_name} (already completed in checkpoint or detected by checkpoint directory)")
+                    continue
+
+                max_samples = config.get('max_samples')
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Processing dataset {i+1}/{len(dataset_configs)}: {dataset_name}")
+                logger.info(f"{'='*60}")
+
+                if max_samples:
+                    logger.info(f"Step 1: Downloading {dataset_name} (up to {max_samples} samples)...")
+                else:
+                    logger.info(f"Step 1: Downloading {dataset_name} (ENTIRE DATASET)...")
+
+                try:
+                    tokenized_data = []
+                    for sample in self.load_dataset_streaming(config):
+                        tokenized_data.append(sample)
+                        if len(tokenized_data) % 2000 == 0:
+                            logger.info(f"Collected {len(tokenized_data)} samples from {dataset_name}")
+                    if not tokenized_data:
+                        logger.warning(f"No valid data collected from {dataset_name}, skipping...")
+                        continue
+                    logger.info(f"Downloaded {len(tokenized_data)} samples from {dataset_name} (ENTIRE DATASET)")
+                    # Step 2: Train on the data
+                    logger.info(f"Step 2: Training on {dataset_name}...")
+                    self._train_on_dataset(tokenized_data, dataset_name, i)
+                    # Step 3: Save global checkpoint (model, tokenizer, progress)
+                    logger.info(f"Step 3: Saving global checkpoint after {dataset_name}...")
+                    global_ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    if self.model is not None:
+                        self.model.save_pretrained(str(global_ckpt_dir))
+                    if self.tokenizer is not None:
+                        self.tokenizer.save_pretrained(str(global_ckpt_dir))
+                    completed_datasets.add(dataset_name) # Add to completed_datasets set
+                    with open(progress_file, 'w') as pf:
+                        json.dump({"completed_datasets": list(completed_datasets)}, pf, indent=2) # Save as list
+                    # Step 4: Clear data from memory (delete)
+                    logger.info(f"Step 4: Clearing {dataset_name} data from memory...")
+                    del tokenized_data
+                    gc.collect()
+                    logger.info(f"Completed processing {dataset_name}")
+                except Exception as e:
+                    logger.error(f"Error processing {dataset_name}: {e}")
+                    continue
+        except KeyboardInterrupt:
+            logger.warning("Training interrupted by user! Saving emergency global checkpoint...")
+            global_ckpt_dir.mkdir(parents=True, exist_ok=True)
+            if self.model is not None:
+                self.model.save_pretrained(str(global_ckpt_dir))
+            if self.tokenizer is not None:
+                self.tokenizer.save_pretrained(str(global_ckpt_dir))
+            with open(progress_file, 'w') as pf:
+                json.dump({"completed_datasets": list(completed_datasets)}, pf, indent=2)
+            logger.info("Emergency global checkpoint saved. You can resume training later.")
+            logger.info("Exiting cleanly after interruption.")
+            return
         logger.info("FAST Download → Train → Save → Delete pipeline completed!")
+
+    def load_model_and_tokenizer_from_path(self, model_path: str):
+        """Load model and tokenizer from a given path (for checkpoint resume)."""
+        logger.info(f"Loading model/tokenizer from checkpoint: {model_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, model_max_length=self.config.max_length)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16 if self.config.fp16 and torch.cuda.is_available() else torch.float32,
+            device_map="auto" if torch.cuda.is_available() else None,
+            low_cpu_mem_usage=True,
+            attn_implementation="flash_attention_2" if torch.cuda.is_available() else "eager"
+        )
+        self.model = self.model.to(self.device)
+        if self.config.use_lora:
+            self._apply_lora()
+        self.model.train()
+        logger.info(f"Model loaded from checkpoint. Parameters: {self.model.num_parameters():,}")
     
     def _train_on_dataset(self, tokenized_data: List[Dict], dataset_name: str, dataset_idx: int):
-        """Train on a single dataset."""
+        """Train on a single dataset with highly accurate ETA logging."""
         # Create dataset
         dataset = AdvancedDataset(tokenized_data, self.tokenizer, self.config.max_length)
-        
         # Setup training arguments optimized for AMD Radeon RX 580
         training_args = TrainingArguments(
             output_dir=f"{self.config.output_dir}/temp_training_{dataset_name}",
@@ -581,29 +650,32 @@ class AdvancedJARVISTrainer:
             ignore_data_skip=False,
             warmup_steps=self.config.warmup_steps,  # Add warmup for AMD stability
         )
-        
         # Create data collator
         data_collator = DataCollatorForLanguageModeling(
             tokenizer=self.tokenizer,  # type: ignore
             mlm=False,
         )
-        
         # Create trainer
+        total_steps = len(dataset) // (self.config.batch_size * self.config.gradient_accumulation_steps)
         trainer = Trainer(
             model=self.model,
             args=training_args,
             train_dataset=dataset,
             data_collator=data_collator,
-            callbacks=[ProgressBarCallback()]
+            callbacks=[ProgressBarCallback(total_steps=total_steps)]
         )
-        
         # Fix label_names warning
         trainer.label_names = []
-        
-        # Train
-        trainer.train()
-        
-        logger.info(f"Training completed on {dataset_name}")
+        logger.info(f"[ETA] Starting training on {dataset_name} | Estimated steps: {total_steps}")
+        # Train with KeyboardInterrupt handling for immediate checkpoint
+        try:
+            trainer.train()
+            logger.info(f"Training completed on {dataset_name}")
+        except KeyboardInterrupt:
+            logger.warning(f"Training interrupted by user during {dataset_name}! Saving immediate checkpoint...")
+            trainer.save_model()
+            logger.info(f"Immediate checkpoint saved for {dataset_name}. You can resume training from this point.")
+            raise
     
     def train_streaming(self, dataset_configs: List[Dict]):
         """Train using streaming datasets for memory efficiency."""
@@ -729,6 +801,7 @@ def main():
     parser.add_argument("--mode", type=str, default="download-train-save-delete", 
                        choices=["download-train-save-delete", "streaming"], 
                        help="Training mode")
+    # Add resume_from_global_checkpoint flag (optional)
     args = parser.parse_args()
     # Load config
     with open(args.config, 'r') as f:
