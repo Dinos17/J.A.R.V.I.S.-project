@@ -1,0 +1,88 @@
+{
+  "system_info": {
+    "gpu": "NVIDIA T4 x2 (32GB VRAM total)",
+    "cpu": "8+ vCores (cloud)",
+    "ram": "32GB+ DDR4",
+    "os": "Linux (recommended)",
+    "optimization_level": "T4x2_Optimized"
+  },
+
+  "model": {
+    "model_name": "distilgpt2",
+    "batch_size": 8,
+    "max_length": 32,
+    "learning_rate_pretraining": 3e-5,
+    "learning_rate_finetuning": 5e-6,
+    "lora_enabled": false,
+    "lora_dropout": 0.1
+  },
+
+  "lora": {
+    "r": 8,
+    "alpha": 16,
+    "dropout": 0.1,
+    "target_modules": ["c_attn", "c_proj", "c_fc"],
+    "bias": "none"
+  },
+
+  "training": {
+    "gradient_accumulation_steps": 1,
+    "max_steps": 1000,
+    "num_epochs": 1,
+    "warmup_steps": 10,
+    "weight_decay": 0.01,
+    "save_steps": 100,
+    "eval_steps": 100,
+    "save_total_limit": 1,
+    "sample_skip_rate": 1,
+    "fp16": true,
+    "gradient_checkpointing": false
+  },
+
+  "memory": {
+    "chunk_size": 1000,
+    "max_memory_usage": 14000,
+    "gpu_memory_fraction": 0.95,
+    "pin_memory": true
+  },
+
+  "datasets": {
+    "finetuning": {
+      "sharegpt52k": {
+        "enabled": true,
+        "dataset_id": "RyokoAI/ShareGPT52K",
+        "max_samples": 5000,
+        "data_files": null,
+        "conversation_format": null
+      },
+      "dialogstudio": {
+        "enabled": true,
+        "max_samples": 5000
+      }
+    },
+    "pretraining": {
+      "c4": {
+        "enabled": true,
+        "max_samples": 5000
+      },
+      "redpajama": {
+        "enabled": true,
+        "max_samples": 5000
+      }
+    }
+  },
+
+  "output": {
+    "base_dir": "models/JARVIS",
+    "checkpoint_dir": "data/checkpoints",
+    "logs_dir": "logs"
+  },
+
+  "performance_estimates": {
+    "training_time_per_dataset": "0.5-1 hours",
+    "total_training_time": "2-4 hours",
+    "memory_usage": "12-14GB VRAM",
+    "cpu_usage": "40-60%",
+    "ram_usage": "16-24GB"
+  }
+} 
